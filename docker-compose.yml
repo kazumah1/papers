@@ -1,0 +1,41 @@
+services:
+
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg18-trixie
+    restart: always
+    shm_size: 128mb
+    container_name: pg
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_PASSWORD: app_pw
+      POSTGRES_USER: app
+      POSTGRES_DB: app_db
+    ports:
+      - "5433:5432"
+    
+  redis:
+    image: redis:7-alpine
+    restart: always
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+  
+  redisinsight:
+    image: redis/redisinsight:latest
+    restart: always
+    container_name: redisinsight
+    ports:
+      - "5540:5540"
+    depends_on:
+      - redis
+    profiles:
+      - "dev"
+    environment:
+      - RI_APP_HOST=0.0.0.0
+
+volumes:
+  pg_data:
+  redis_data:
