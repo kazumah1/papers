@@ -28,12 +28,6 @@ def _redis_server():
     )
     return r
 
-def get_job():
-    r = _redis_server()
-    job = r.rpop("jobs")
-    unserialized_job = json.loads(job)
-    return unserialized_job
-
 def _postgres_db():
     load_dotenv()
     if os.getenv("DEVELOPMENT") == "true":

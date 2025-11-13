@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from google.cloud import storage
 from PyPDF2 import PdfReader
 from jobs import *
+from ...infra.postgres import _postgres_db
 import psycopg
 import io
 import json
@@ -14,6 +15,7 @@ class Ingestor:
     def __init__(self):
         self.url:str = "http://export.arxiv.org/api/query?"
         self.entries:[] = []
+        self.conn = _postgres_db()
     
     def _get_url(self, entry):
         '''returns the url of a specific entry'''
@@ -67,5 +69,13 @@ class Ingestor:
         blob.upload_from_string(response.content, content_type="application/pdf")
 
     def db_push(self, serialized_job):
-        
         job = json.dumps(serialized_job)
+
+        self.conn.execute(
+            f"""INSERT INTO Papers 
+                (external_id, source, title, authors, pdf_url, html_url, content_hash, published_at) 
+                VALUES 
+                (%(id)s, %(source)s, %(title)s, %(authors)s, %(pdf_url)s, %(html_url)s, %(content_hash)s, %(published_at)s)
+            """,
+            job
+        )
