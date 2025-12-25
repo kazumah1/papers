@@ -10,86 +10,7 @@ import io
 from rq import Queue
 from ingestor import Ingestor
 from processor import Processor
-
-def _redis_server():
-    load_dotenv()
-    if os.getenv("DEVELOPMENT") == 'true':
-        url = os.getenv("REDIS_URL_DEV")
-        pw = ""
-    else:
-        url = os.getenv("REDIS_URL")
-        pw = os.getenv("REDIS_PASSWORD")
-    r = redis.Redis(
-        host=url,
-        port=11283,
-        decode_responses=True,
-        username="default",
-        password=pw
-    )
-    return r
-
-def _postgres_db():
-    load_dotenv()
-    if os.getenv("DEVELOPMENT") == "true":
-        db_name = os.getenv("POSTGRES_DB_DEV")
-        db_user = os.getenv("POSTGRES_USER_DEV")
-        db_pass = os.getenv("POSTGRES_PASSWORD_DEV")
-    else:
-        db_name = os.getenv("POSTGRES_DB_PROD")
-        db_user = os.getenv("POSTGRES_USER_PROD")
-        db_pass = os.getenv("POSTGRES_PASSWORD_PROD")
-    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433)
-    conn.execute("""
-        SELECT EXISTS (
-            SELECT FROM information_schema.tables
-            WHERE table_name = 'papers'
-        )
-    """)
-    try:
-        table_exists = conn.cursor().fetchone()
-    except Exception:
-        table_exists = None
-    if not table_exists:
-        conn.execute("""
-            CREATE EXTENSION IF NOT EXISTS 'pgcrypto'
-        """)
-        conn.execute("""
-            CREATE TABLE Papers (
-                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                external_id STRING NOT NULL UNIQUE,
-                title STRING NOT NULL,
-                authors STRING[] NOT NULL,
-                pdf_url STRING NOT NULL,
-                html_url STRING NOT NULL,
-                content_hash BINARY(32) NOT NULL UNIQUE,
-                published_at DATETIME NOT NULL
-            )
-        """)
-        conn.commit()
-    else:
-        conn.execute("DROP TABLE Papers")
-        conn.commit()
-    return conn
-
-def db_get(table, id):
-    conn = _postgres_db()
-    conn.execute(f"""
-        SELECT * FROM {table} WHERE id == {id}
-    """)
-    for record in conn:
-        print(record)
-    for record in conn:
-        return record
-
-def db_add(metadata):
-    # TODO: verify metadata is in right format
-    conn = _postgres_db()
-    # TODO: ensure metadata has this format: (id, title, author, pdf_url, html_url, current_datetime)
-    conn.execute(
-        f"INSERT INTO Papers (id, title, author, pdf_url, html_url, created_at) VALUES (%(id)s, %(title)s, %(author)s, %(pdf_url)s, %(html_url)s, %(created_at)s)",
-        metadata
-    )
-    return True
+from pgvector.psycopg import register_vector
 
 class ArxivDataManager:
     def __init__(self):
@@ -178,6 +99,7 @@ class JobManager:
     
     def add_job(self, job: dict):
         r = self.redis
+        # TODO: use pydantic
         required_fields = set(
             "id",
             "title",
@@ -194,11 +116,11 @@ class JobManager:
         for key in job.keys():
             if key not in required_fields:
                 raise ValueError("missing or incorrect key: ", key)
-        serialized_job = json.loads(job)
+        serialized_job = json.dumps(job)
         if job['job_type'] in ['store', 'db_push']:
             self.ingest_q.enqueue(self.JOBS[job['job_type']], serialized_job)
         else:
-            self.process_q.enqueue(self.Jobs[job['job_type']], serialized_job)
+            self.process_q.enqueue(self.JOBS[job['job_type']], serialized_job)
         
 
     def create_job_set(self, entry):
@@ -214,7 +136,7 @@ class JobManager:
         '''
         pdf_url = self.arxiv.get_pdf_url(entry)
         content_hash = self.hash_file(pdf_url)
-        job_id = "arxiv:" + entry['id'][21:]
+        job_id = "arxiv." + entry['id'][21:]
         authors = self.arxiv.get_authors(entry)
         html_url = self.arxiv.convert_url_to_html_url(entry["id"])
         title = entry['title']
