@@ -115,7 +115,7 @@ class Processor:
         job = json.loads(serialized_job)
         html_url = job['html_url']
         paper_id = job['id']
-        text = self.read(html_url)
+        text, abstract = self.read_and_get_abstract(html_url)
         print(f"text sample : {text[:250]}")
         summary_text = self.openai_client.summarize(text)
         # need to extract Abstract by parsing
@@ -130,7 +130,7 @@ class Processor:
         if paper:
             self.db.execute(f"""
                 UPDATE papers
-                SET summary = '{summary_text}'
+                SET summary = '{summary_text}', abstract = '{abstract}'
                 WHERE external_id = {paper_id};
             """)
             self.db.commit()
@@ -138,7 +138,7 @@ class Processor:
 
 
 
-    def read(self, html_url):
+    def read_and_get_abstract(self, html_url):
         '''
         for returning the raw html/xhtml of the paper html link
         args:
@@ -148,7 +148,9 @@ class Processor:
         response = requests.get(html_url)
         content = response.text
         soup = BeautifulSoup(content, 'html.parser')
-        return " ".join(soup.get_text().split())
+        abstract_header = soup.find('h6', string="Abstract")
+        abstract_text = abstract_header.next_sibling.next_sibling.string
+        return " ".join(soup.get_text().split()), abstract_text
 
     
     def keywords(self, serialized_job):
