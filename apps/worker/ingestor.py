@@ -3,79 +3,62 @@ import requests
 import hashlib
 import feedparser
 from bs4 import BeautifulSoup
-from google.cloud import storage
 from PyPDF2 import PdfReader
-from jobs import *
-from ...infra.postgres import _postgres_db
+from infra.postgres import _postgres_db
+from infra.gcs import upload_paper
+from utils.utils import Colors
 import psycopg
 import io
 import json
 
-class Ingestor:
-    def __init__(self):
-        self.url:str = "http://export.arxiv.org/api/query?"
-        self.entries:[] = []
-        self.conn = _postgres_db()
-    
-    def _get_url(self, entry):
-        '''returns the url of a specific entry'''
-        return entry["id"]
+URL : str = "http://export.arxiv.org/api/query?"
+CONN = _postgres_db()
 
-    def _get_entries(self, parser_output):
-        '''returns the entries array from the raw feedparser output'''
-        return parser_output["entries"]
+def _get_url(entry):
+    '''returns the url of a specific entry'''
+    return entry["id"]
 
+def _get_entries(parser_output):
+    '''returns the entries array from the raw feedparser output'''
+    return parser_output["entries"]
 
-    def search(self, search_queries:list(str), max_results:int=10, page:int=0, sort:str="submittedDate", sort_order:str="descending"):
-        search_arg = "+AND+".join(search_queries)
-        url = self.url + f'search_query={search_arg}&start={page}&max_results={max_results}&sortBy={sort}&sortOrder={sort_order}'
-        response = requests.get(url)
-        d = feedparser.parse(response.text)
-        entries = self._get_entries(d)
-        # for entry in entries:
-        #     self.ingest(entry)
-        return d
+def search(search_queries:list(str), max_results:int=10, page:int=0, sort:str="submittedDate", sort_order:str="descending"):
+    global URL
+    search_arg = "+AND+".join(search_queries)
+    url = URL + f'search_query={search_arg}&start={page}&max_results={max_results}&sortBy={sort}&sortOrder={sort_order}'
+    response = requests.get(url)
+    d = feedparser.parse(response.text)
+    entries = _get_entries(d)
+    # for entry in entries:
+    #     ingest(entry)
+    return entries
 
-    def read(self, html_url):
-        '''
-        for returning the raw html/xhtml of the paper html link
-        args:
-            url: url for the html page
-        '''
-        # don't like that this takes in url not page
-        response = requests.get(html_url)
-        content = response.text
-        soup = BeautifulSoup(content, 'html.parser')
-        print(soup.get_text())
-        return soup
+def store(serialized_job):
+    '''
+    for storing the raw pdf of the paper to GCS
+    '''
+    # ingest doc to object storage
+    job = json.loads(serialized_job)
+    pdf_url = job["pdf_url"]
+    response = requests.get(pdf_url)
+    filename = job["content_hash"] + ".pdf"
 
-    def store(self, serialized_job):
-        '''
-        for storing the raw pdf of the paper to GCS
-        '''
-        # ingest doc to object storage
-        job = json.dumps(serialized_job)
-        pdf_url = job["pdf_url"]
-        response = requests.get(pdf_url)
-        storage_client = storage.Client()
-        bucket = storage_client.bucket('storage-papers')
+    upload_paper(filename, response.content)
 
-        filename = job["content_hash"] + ".pdf"
-        # whole point of hashing files
-        if self._file_exists(filename):
-            return
-        blob = bucket.blob(f"raw/{filename[:2]}/{filename[2:4]}/{filename}")
+    print(f"{Colors.GREEN}Successfully stored paper to GCS{Colors.WHITE}")
 
-        blob.upload_from_string(response.content, content_type="application/pdf")
+def db_push(serialized_job):
+    global CONN
+    job = json.loads(serialized_job)
 
-    def db_push(self, serialized_job):
-        job = json.dumps(serialized_job)
-
-        self.conn.execute(
-            f"""INSERT INTO Papers 
-                (external_id, source, title, authors, pdf_url, html_url, content_hash, published_at) 
-                VALUES 
-                (%(id)s, %(source)s, %(title)s, %(authors)s, %(pdf_url)s, %(html_url)s, %(content_hash)s, %(published_at)s)
-            """,
-            job
-        )
+    CONN.execute(
+        f"""INSERT INTO Papers 
+            (external_id, source, title, authors, pdf_url, html_url, content_hash, published_at) 
+            VALUES 
+            (%(id)s, %(source)s, %(title)s, %(authors)s, %(pdf_url)s, %(html_url)s, %(content_hash)s, %(published_at)s)
+            ON CONFLICT (external_id) DO NOTHING;
+        """,
+        job
+    )
+    CONN.commit()
+    print(f"{Colors.GREEN}Successfully stored initial DB entry{Colors.WHITE}")

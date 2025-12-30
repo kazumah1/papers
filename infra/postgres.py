@@ -1,5 +1,6 @@
 from dotenv import load_dotenv
 import psycopg
+from psycopg.rows import dict_row
 import os
 
 def _postgres_db():
@@ -12,7 +13,7 @@ def _postgres_db():
         db_name = os.getenv("POSTGRES_DB_PROD")
         db_user = os.getenv("POSTGRES_USER_PROD")
         db_pass = os.getenv("POSTGRES_PASSWORD_PROD")
-    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433)
+    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433, row_factory=dict_row)
     conn.execute("""
         SELECT EXISTS (
             SELECT FROM information_schema.tables
@@ -37,6 +38,7 @@ def _postgres_db():
                 content_hash BYTEA NOT NULL UNIQUE,
                 abstract TEXT,
                 summary TEXT,
+                search_tsv tsvector,
                 tags TEXT[],
                 published_at TIMESTAMP NOT NULL
             )
@@ -54,7 +56,7 @@ def _images_db():
         db_name = os.getenv("POSTGRES_DB_PROD")
         db_user = os.getenv("POSTGRES_USER_PROD")
         db_pass = os.getenv("POSTGRES_PASSWORD_PROD")
-    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433)
+    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433, row_factory=dict_row)
     conn.execute("""
         SELECT EXISTS (
             SELECT FROM information_schema.tables
@@ -88,7 +90,7 @@ def _vector_db():
         db_name = os.getenv("POSTGRES_DB_PROD")
         db_user = os.getenv("POSTGRES_USER_PROD")
         db_pass = os.getenv("POSTGRES_PASSWORD_PROD")
-    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433)
+    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433, row_factory=dict_row)
     conn.execute("""
         SELECT EXISTS (
             SELECT FROM information_schema.tables
@@ -129,10 +131,11 @@ def db_get_paper(paper_id):
     curr.execute(f"""
         SELECT * FROM papers WHERE external_id = '{paper_id}'
     """)
+    records = []
     for record in curr:
         print(record)
-    for record in curr:
-        return record
+        records.append(record)
+    return records
 
 def db_add(metadata):
     # TODO: verify metadata is in right format
@@ -153,7 +156,7 @@ def test_tables():
     curr = conn.cursor()
     print("papers table")
     curr.execute("""
-        SELECT COUNT (DISTINCT id) FROM papers
+        SELECT COUNT (id) FROM papers
     """)
     print("length:")
     for record in curr:
@@ -211,7 +214,7 @@ def drop_table(table_name):
         db_name = os.getenv("POSTGRES_DB_PROD")
         db_user = os.getenv("POSTGRES_USER_PROD")
         db_pass = os.getenv("POSTGRES_PASSWORD_PROD")
-    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433)
+    conn = psycopg.connect(dbname=db_name, user=db_user, password=db_pass, host="localhost", port=5433, row_factory=dict_row)
     conn.execute(f"""
         DROP TABLE IF EXISTS {table_name}
     """)

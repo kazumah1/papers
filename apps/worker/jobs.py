@@ -7,9 +7,10 @@ import hashlib
 import requests
 from PyPDF2 import PdfReader
 import io
-from rq import Queue
-from ingestor import Ingestor
-from processor import Processor
+from rq import Queue, Worker
+from apps.worker.ingestor import *
+from apps.worker.processor import *
+from utils.utils import Colors
 from pgvector.psycopg import register_vector
 
 class ArxivDataManager:
@@ -47,20 +48,19 @@ class JobManager:
         self.process_q = None
 
         # workers
-        self.ingestor = Ingestor()
-        self.processor = Processor()
+        self.worker = None
 
         # data managers for creating jobs
         self.arxiv = ArxivDataManager()
 
         # job types as of now
         self.JOBS = {
-            'store': self.ingestor.store, 
-            'embed': self.processor.embed, 
-            'db_push': self.ingestor.db_push, 
-            'figures': self.processor.figures, 
-            'summarize': self.processor.summarize, 
-            'keywords': self.processor.keywords
+            'store': store, 
+            'db_push': db_push, 
+            'embed': embed, 
+            'figures': figures, 
+            'summarize': summarize, 
+            'keywords': keywords
         }
 
 
@@ -68,23 +68,25 @@ class JobManager:
  
     def initialize_redis(self):
         load_dotenv()
-        load_dotenv()
         if os.getenv("DEVELOPMENT") == 'true':
-            url = os.getenv("REDIS_URL_DEV")
+            url = os.getenv("REDIS_HOST_DEV")
+            port = os.getenv("REDIS_PORT")
             pw = ""
         else:
-            url = os.getenv("REDIS_URL")
+            url = os.getenv("REDIS_HOST")
+            port = os.getenv("REDIS_PORT")
             pw = os.getenv("REDIS_PASSWORD")
         r = redis.Redis(
             host=url,
-            port=11283,
-            decode_responses=True,
+            port=port,
+            decode_responses=False,
             username="default",
             password=pw
         )
         self.redis = r
-        self.ingest_q = Queue("ingest", connection=self.redis)
-        self.process_q = Queue("process", connection=self.redis)
+        # self.ingest_q = Queue("ingest", connection=self.redis)
+        # self.process_q = Queue("process", connection=self.redis)
+        # self.worker = Worker([self.ingest_q, self.process_q], connection=self.redis)
 
     def hash_file(self, pdf_url):
         response = requests.get(pdf_url)
@@ -100,7 +102,7 @@ class JobManager:
     def add_job(self, job: dict):
         r = self.redis
         # TODO: use pydantic
-        required_fields = set(
+        required_fields = {
             "id",
             "title",
             "authors",
@@ -112,15 +114,21 @@ class JobManager:
             "published_at",
             "tags",
             "job_type"
-        )
+            }
         for key in job.keys():
             if key not in required_fields:
                 raise ValueError("missing or incorrect key: ", key)
+        print(job['job_type'])
+        for k, v in job.items():
+            print(f"{k} : {type(v)}")
         serialized_job = json.dumps(job)
-        if job['job_type'] in ['store', 'db_push']:
-            self.ingest_q.enqueue(self.JOBS[job['job_type']], serialized_job)
-        else:
-            self.process_q.enqueue(self.JOBS[job['job_type']], serialized_job)
+        res = r.xadd("job_queue", {"job" : serialized_job}, maxlen=120, approximate=False)
+        print()
+        print(res)
+        # if job['job_type'] in {'store', 'db_push'}:
+        #     self.ingest_q.enqueue(self.JOBS[job['job_type']], serialized_job)
+        # else:
+        #     self.process_q.enqueue(self.JOBS[job['job_type']], serialized_job)
         
 
     def create_job_set(self, entry):
@@ -156,4 +164,68 @@ class JobManager:
                 "tags":tags,
                 "job_type":job_type
             }
-            self.add_job(job)
+            self.add_job(job=job)
+
+
+    def start_workers(self):
+        retries = 3
+        while True:
+            try:
+                jobs = self.redis.xread(streams={"job_queue":0}, count=6, block=300)
+                if jobs and jobs[0] and jobs[0][1]:
+                    job = jobs[0][1][0]
+                    job_id, serialized_job = job[0], job[1].get(b'job', None)
+                    serialized_job = serialized_job.decode("utf-8")
+                    unserialized_job = json.loads(serialized_job)
+                    job_func = self.JOBS[unserialized_job['job_type']]
+                    print(f"{Colors.BLUE}Job: {unserialized_job['job_type']}{Colors.WHITE}")
+                    print(job[1])
+                    try:
+                        job_func(serialized_job)
+                    except Exception as e:
+                        print(f"{Colors.RED}{unserialized_job['job_type']} failed with exception {e}{Colors.WHITE}")
+                        i = 1
+                        success = False
+                        while i <= retries and success == False:
+                            print(f"Retrying, attempt {i} / {retries}:")
+                            try:
+                                job_func(serialized_job)
+                                success = True
+                            except Exception as e:
+                                print(f"{Colors.RED}attempt failed{Colors.WHITE}")
+                            i += 1
+                    self.redis.xdel("job_queue", job_id)
+            except (KeyboardInterrupt, SystemExit):
+                self.jobs_info()
+                raise
+            
+
+    def jobs_info(self): 
+        print("Queue State")
+        print(f"queue length: {self.redis.xlen('job_queue')}")
+        # print("Ingest Workers")
+        # for w in ingest_workers:
+        #     print(f"Worker {w.name}:")
+        #     print("Successful Jobs | Failed Jobs | Total Working Time")
+        #     print(f"   {w.successful_job_count}   |   {w.failed_job_count}   |   {w.total_working_time}   ")
+
+        # print()
+        # print("Process Workers")
+        # for w in process_workers:
+        #     print(f"Worker {w.name}:")
+        #     print("Successful Jobs | Failed Jobs | Total Working Time")
+        #     print(f"   {w.successful_job_count}   |   {w.failed_job_count}   |   {w.total_working_time}   ")
+
+    def clear_job_queue(self):
+        res = self.redis.xtrim("job_queue", maxlen=0, approximate=False)
+        print(res)
+        self.jobs_info()
+
+if __name__ == "__main__":
+    job_manager = JobManager()
+    job_manager.clear_job_queue()
+    entries = search(search_queries=["quantum physics"])
+    entry = entries[0]
+    # print(entry)
+    job_manager.create_job_set(entry)
+    job_manager.start_workers()
