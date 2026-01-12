@@ -8,7 +8,7 @@ import requests
 from PyPDF2 import PdfReader
 import io
 from rq import Queue, Worker
-from apps.worker.ingestor import *
+from infra.postgres import _postgres_db, _vector_db, _images_db, new_conn
 from apps.worker.processor import *
 from utils.utils import Colors
 from pgvector.psycopg import register_vector
@@ -20,7 +20,7 @@ class ArxivDataManager:
         '''converts original arxiv paper url to html url'''
         html_url = url[:17] + 'html' + url[20:] 
         return html_url
-    
+   
     def get_pdf_url(self, entry):
         links = entry["links"]
         for link in links:
@@ -55,16 +55,45 @@ class JobManager:
 
         # job types as of now
         self.JOBS = {
-            'store': store, 
-            'db_push': db_push, 
             'embed': embed, 
             'figures': figures, 
             'summarize': summarize, 
             'keywords': keywords
         }
 
+        print("Loaded papers table:", _postgres_db())
+        print("Loaded vectors table:", _vector_db())
+        print("Loaded images table:", _images_db())
 
         self.initialize_redis()
+
+    def store(self, job: dict):
+        '''
+        for storing the raw pdf of the paper to GCS
+        '''
+        # ingest doc to object storage
+        pdf_url = job["pdf_url"]
+        response = requests.get(pdf_url)
+        filename = job["content_hash"] + ".pdf"
+
+        upload_paper(filename, response.content)
+
+        print(f"{Colors.GREEN}Successfully stored paper to GCS{Colors.WHITE}")
+
+    def db_push(self, job: dict):
+        with new_conn() as conn:
+            conn.execute(
+                f"""INSERT INTO Papers 
+                    (external_id, source, title, authors, pdf_url, html_url, content_hash, published_at) 
+                    VALUES 
+                    (%(id)s, %(source)s, %(title)s, %(authors)s, %(pdf_url)s, %(html_url)s, %(content_hash)s, %(published_at)s)
+                    ON CONFLICT (external_id) DO NOTHING;
+                """,
+                job
+            )
+            conn.commit()
+        print(f"{Colors.GREEN}Successfully stored initial DB entry{Colors.WHITE}")
+
  
     def initialize_redis(self):
         load_dotenv()
@@ -118,13 +147,8 @@ class JobManager:
         for key in job.keys():
             if key not in required_fields:
                 raise ValueError("missing or incorrect key: ", key)
-        print(job['job_type'])
-        for k, v in job.items():
-            print(f"{k} : {type(v)}")
         serialized_job = json.dumps(job)
         res = r.xadd("job_queue", {"job" : serialized_job}, maxlen=120, approximate=False)
-        print()
-        print(res)
         # if job['job_type'] in {'store', 'db_push'}:
         #     self.ingest_q.enqueue(self.JOBS[job['job_type']], serialized_job)
         # else:
@@ -150,6 +174,20 @@ class JobManager:
         title = entry['title']
         publish_date = entry['published']
         tags = self.arxiv.get_tags(entry)
+        job = {
+            "id":job_id,
+            "title":title,
+            "authors":authors,
+            "pdf_url":pdf_url,
+            "html_url":html_url,
+            "source":"arxiv",
+            "content_hash":content_hash,
+            "license":"",
+            "published_at":publish_date,
+            "tags":tags
+        }
+        self.store(job)
+        self.db_push(job)
         for job_type in self.JOBS.keys():
             job = {
                 "id":job_id,

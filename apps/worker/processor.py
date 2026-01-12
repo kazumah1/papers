@@ -1,8 +1,8 @@
 import json
 from bs4 import BeautifulSoup
-from infra.postgres import _postgres_db, _images_db, _vector_db, test_tables, db_get_paper, drop_table
-from infra.gcs import upload_figure
-from apps.llm import OpenAIClient
+from infra.postgres import _postgres_db, _images_db, _vector_db, test_tables, db_get_paper, drop_table, new_conn
+from infra.gcs import upload_figure, upload_paper
+from apps.llm import OpenAIClient, OllamaClient
 from utils.utils import Colors
 from sentence_transformers import SentenceTransformer
 from PyPDF2 import PdfReader 
@@ -14,27 +14,52 @@ import re
 import pymupdf
 from PIL import Image
 import requests
+from optparse import TitledHelpFormatter
+import hashlib
+import feedparser
+import psycopg
+import io
+from dotenv import load_dotenv
 
-DB = _postgres_db()
-VECTOR_DB = _vector_db()
-IMAGE_DB = _images_db()
-register_vector(VECTOR_DB)
+load_dotenv()
 
 OPENAI_CLIENT = OpenAIClient()
+OLLAMA_CLIENT = OllamaClient()
 MODEL = SentenceTransformer("nomic-ai/nomic-embed-text-v1", trust_remote_code=True)
 
 chunk_prefix_length = 17
 CONTEXT_LENGTH = 2048 - chunk_prefix_length # length of 'search_document: '
+
+
+URL : str = "http://export.arxiv.org/api/query?"
+
+def _get_url(entry):
+    '''returns the url of a specific entry'''
+    return entry["id"]
+
+def _get_entries(parser_output):
+    '''returns the entries array from the raw feedparser output'''
+    return parser_output["entries"]
+
+def search(search_queries:list(str), max_results:int=10, page:int=0, sort:str="submittedDate", sort_order:str="descending"):
+    global URL
+    search_arg = "+AND+".join(search_queries)
+    url = URL + f'search_query={search_arg}&start={page}&max_results={max_results}&sortBy={sort}&sortOrder={sort_order}'
+    response = requests.get(url)
+    d = feedparser.parse(response.text)
+    entries = _get_entries(d)
+    # for entry in entries:
+    #     ingest(entry)
+    return entries
 
 def embed(serialized_job):
     '''
     generating embeddings with sentencetransformers then storing embeddings + metadata in pgvector vector db 
     for semantic search and later rag
     '''
-    global CONTEXT_LENGTH, MODEL, VECTOR_DB
+    global CONTEXT_LENGTH, MODEL
     job = json.loads(serialized_job)
     
-
     pdf_url = job['pdf_url']
     response = requests.get(pdf_url)
     memfile = BytesIO(response.content)
@@ -80,16 +105,18 @@ def embed(serialized_job):
     # for chunk in text_chunks:
     #    print(chunk)
     #    print()
-    for e in embeddings:
-        VECTOR_DB.execute(
-                "INSERT INTO vectors (external_id, embedding) values (%s, %s)",
-                (job['id'], e,)
-        )
+    with new_conn() as conn:
+        register_vector(conn)
+        for e in embeddings:
+            conn.execute(
+                    "INSERT INTO vectors (external_id, embedding) values (%s, %s)",
+                    (job['id'], e,)
+            )
+        conn.commit()
 
     print(f"{Colors.GREEN}Successfully embedded paper content{Colors.WHITE}")
 
 def figures(serialized_job):
-    global IMAGE_DB
     job = json.loads(serialized_job)
     
     paper_id = job['id']
@@ -120,18 +147,19 @@ def figures(serialized_job):
                 
                 if paper:
                     paper_table_id = paper["id"]
-                    IMAGE_DB.execute(
-                        "INSERT INTO images (blob_url, paper_id, caption) values (%s, %s, %s)",
-                        (file_destination, paper_table_id, "")
-                    )
-                    IMAGE_DB.commit()
+                    with new_conn() as conn:
+                        conn.execute(
+                            "INSERT INTO images (blob_url, paper_id, caption) values (%s, %s, %s)",
+                            (file_destination, paper_table_id, "")
+                        )
+                        conn.commit()
 
                 img_count += 1
     print(f"{Colors.GREEN}Successfully stored figures{Colors.WHITE}")
 
 
 def summarize(serialized_job):
-    global OPENAI_CLIENT, DB
+    global OPENAI_CLIENT
     job = json.loads(serialized_job)
     html_url = job['html_url']
     paper_id = job['id']
@@ -147,25 +175,35 @@ def summarize(serialized_job):
 
     paper = records[0]
     if paper:
-        DB.execute(f"""
-            UPDATE papers
-            SET abstract = '{paper_abstract}'
-            WHERE external_id = '{paper_id}';
-        """)
-        print(f"{Colors.GREEN}Successfully extracted abstract{Colors.WHITE}")
-        try:
-            summary_text = OPENAI_CLIENT.summarize(text)
-            DB.execute(f"""
+        with new_conn() as conn:
+            conn.execute(f"""
                 UPDATE papers
-                SET summary = '{summary_text}'
+                SET abstract = '{paper_abstract}'
                 WHERE external_id = '{paper_id}';
             """)
-            print(f"{Colors.GREEN}Successfully summarized paper{Colors.WHITE}")
-            DB.commit()
-        except Exception as e:
-            DB.commit()
-            raise ValueError("Error saving summary")
-
+            conn.commit()
+            print(f"{Colors.GREEN}Successfully extracted abstract{Colors.WHITE}")
+            try:
+                summary_text = OPENAI_CLIENT.summarize(text)
+                conn.execute(f"""
+                    UPDATE papers
+                    SET summary = '{summary_text}'
+                    WHERE external_id = '{paper_id}';
+                """)
+                print(f"{Colors.GREEN}Successfully summarized paper with OpenAI{Colors.WHITE}")
+                conn.commit()
+            except Exception as e:
+                try:
+                    summary_text = OLLAMA_CLIENT.summarize(text)
+                    conn.execute(f"""
+                    UPDATE papers
+                    SET summary = '{summary_text}'
+                    WHERE external_id = '{paper_id}';
+                    """)
+                    print(f"{Colors.GREEN}Successfully summarized paper with Ollama{Colors.WHITE}")
+                    conn.commit()
+                except Exception as e:
+                    raise ValueError("Error saving summary")
     return True
 
 
@@ -201,36 +239,41 @@ def keywords(serialized_job):
         print(f"{Colors.YELLOW}More than one paper returned{Colors.WHITE}")
     paper = records[0]
     if paper:
-        print(paper)
         title = paper['title']
         abstract = paper['abstract']
         if title is None or abstract is None:
             raise ValueError("Error getting keywords: no title or abstract")
         text = title + abstract
-        DB.execute(f"""
-            UPDATE papers
-            SET search_tsv = to_tsvector('english', '{text}')
-            WHERE external_id = '{paper_id}';
-        """)
-        # DB.commit()
+        with new_conn() as conn:
+            conn.execute(f"""
+                UPDATE papers
+                SET search_tsv = to_tsvector('english', '{text}')
+                WHERE external_id = '{paper_id}';
+            """)
+            conn.commit()
     print("Successfully stored keywords")
     return True
 
 
 if __name__ == "__main__":
-    # test_tables()
-    # drop_table("papers")
+    try:
+        test_tables()
+    except Exception as e:
+        print("Error testing tables:", e)
+    print(drop_table("papers"))
+    print(drop_table("vectors"))
+    print(drop_table("images"))
     job = {
             "id": "arxiv.2511.11551",
             "pdf_url": "https://arxiv.org/pdf/2511.11551",
             "html_url": "https://arxiv.org/html/2511.11551",
     }
-    print(summarize(json.dumps(job)))
+    # print(summarize(json.dumps(job)))
     job2 = {
             "id":"arxiv.2512.22121v1",
             "pdf_url": "https://arxiv.org/pdf/2512.22121v1",
             "html_url": "https://arxiv.org/html/2512.22121v1",
     }
-    print(summarize(json.dumps(job2)))
+    # print(summarize(json.dumps(job2)))
     # print(keywords(json.dumps(job)))
     # figures(json.dumps(job))
