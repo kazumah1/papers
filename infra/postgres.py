@@ -1,8 +1,10 @@
+import json
 from dotenv import load_dotenv
 from pgvector.psycopg import register_vector
 import psycopg
 from psycopg.rows import dict_row
 import os
+import numpy as np
 
 def new_conn():
     load_dotenv()
@@ -144,33 +146,75 @@ def db_get_paper(paper_id):
     records = []
     with new_conn() as conn:
         curr = conn.cursor()
-        curr.execute(f"""
-            SELECT * FROM papers WHERE external_id = '{paper_id}'
-        """)
+        curr.execute("SELECT * FROM papers WHERE external_id = %s",
+        (paper_id,))
         for record in curr:
-            print(record)
             records.append(record)
     return records
 
-def db_paper_search(query_embeddings):
+def db_search_by_pdf_url(pdf_url):
+    records = []
+    with new_conn() as conn:
+        curr = conn.cursor()
+        curr.execute("""
+            SELECT * FROM papers WHERE pdf_url = %s
+        """,
+        (pdf_url,))
+        for record in curr:
+            records.append(record)
+    return records
+
+def db_get_entry(entry_id):
+    records = []
+    with new_conn() as conn:
+        curr = conn.cursor()
+        curr.execute("""
+            SELECT * FROM papers WHERE id = %s
+        """,
+        (entry_id,))
+        for record in curr:
+            records.append(record)
+    print(len(records))
+    return records.pop()
+
+def db_semantic_search(query_embeddings):
     records = []
     paper_records = []
     with new_conn() as conn:
         for e in query_embeddings:
             curr = conn.cursor()
-            curr.execute(f"""
-                SELECT * FROM vectors ORDER BY embedding <-> '{e.tolist()}' LIMIT 5;
-            """)
+            curr.execute("""
+                SELECT * FROM vectors ORDER BY embedding <-> %s LIMIT 25;
+            """,
+            (e.tolist(),))
             for record in curr:
                 records.append(record)
         for record in records:
             paper_id = record['external_id']
-            curr = conn.cursor()
-            curr.execute(f"""
-                SELECT * FROM papers WHERE external_id = '{paper_id}';
-            """)
-            for r in curr:
+            paper_rs = db_get_paper(paper_id)
+            for r in paper_rs:
+                r['embedding'] = np.asarray(json.loads(record['embedding']))
                 paper_records.append(r)
+    return paper_records
+
+def db_keyword_search(keywords: list):
+    records = []
+    paper_records = []
+    with new_conn() as conn:
+        curr = conn.cursor()
+        curr.execute("""
+            SELECT DISTINCT ON (external_id) * FROM papers WHERE search_tsv @@ to_tsquery(%s) ORDER BY external_id, published_at DESC LIMIT 25;
+        """,
+        (" | ".join(keywords),))
+        for record in curr:
+            records.append(record)
+
+        for record in records:
+            paper_id = record['external_id']
+            paper_rs = db_get_paper(paper_id)
+            for r in paper_rs:
+                record['embedding'] = np.asarray(json.loads(r['embedding']))
+                paper_records.append(record)
     return paper_records
 
 def db_add(metadata):
@@ -178,7 +222,7 @@ def db_add(metadata):
     with new_conn() as conn:
         # TODO: ensure metadata has this format: (id, title, author, pdf_url, html_url, current_datetime)
         conn.execute(
-            f"""INSERT INTO Papers 
+            """INSERT INTO Papers 
                 (id, external_id, title, author, pdf_url, html_url, content_hash, created_at) 
                 VALUES 
                 (%(id)s, %(external_id)s, %(title)s, %(author)s, %(pdf_url)s, %(html_url)s, %(content_hash)s, %(created_at)s)
@@ -224,7 +268,7 @@ def test_tables():
         curr_vectors = conn.cursor()
         print("vectors table")
         curr.execute("""
-            SELECT COUNT (DISTINCT id) FROM images
+            SELECT COUNT (DISTINCT id) FROM vectors
         """)
         print("length:")
         for record in curr:
@@ -233,8 +277,8 @@ def test_tables():
         curr_vectors.execute("""
             SELECT * FROM vectors
         """)
-        # for record in curr_vectors:
-        #     print(record)
+        for record in curr_vectors:
+            print(record['external_id'])
     return True
 
 def drop_table(table_name):
@@ -252,9 +296,10 @@ def drop_table(table_name):
     try:
         with new_conn() as conn:
             conn.execute("SET lock_timeout = '5s'")
-            conn.execute(f"""
-                DROP TABLE IF EXISTS {table_name}
-            """)
+            conn.execute("""
+                DROP TABLE IF EXISTS %s
+            """,
+            (table_name,))
             conn.commit()
     except Exception as e:
         print("Error dropping table:", e)

@@ -2,6 +2,7 @@ import json
 from bs4 import BeautifulSoup
 from infra.postgres import _postgres_db, _images_db, _vector_db, test_tables, db_get_paper, drop_table, new_conn
 from infra.gcs import upload_figure, upload_paper
+from infra.redis import cache_pdf, get_cached_pdf
 from apps.llm import OpenAIClient, OllamaClient
 from utils.utils import Colors
 from sentence_transformers import SentenceTransformer
@@ -61,8 +62,13 @@ def embed(serialized_job):
     job = json.loads(serialized_job)
     
     pdf_url = job['pdf_url']
-    response = requests.get(pdf_url)
-    memfile = BytesIO(response.content)
+    pdf_content = get_cached_pdf(job['external_id'])
+    if pdf_content is None:
+        pdf_url = job["pdf_url"]
+        response = requests.get(pdf_url)
+        pdf_content = response.content
+        cache_pdf(job['external_id'], pdf_content)
+    memfile = BytesIO(pdf_content)
     reader = PdfReader(memfile)
 
 
@@ -121,8 +127,13 @@ def figures(serialized_job):
     
     paper_id = job['id']
     pdf_url = job['pdf_url']
-    response = requests.get(pdf_url)
-    filestream = BytesIO(response.content)
+    pdf_content = get_cached_pdf(job['external_id'])
+    if pdf_content is None:
+        pdf_url = job["pdf_url"]
+        response = requests.get(pdf_url)
+        pdf_content = response.content
+        cache_pdf(job['external_id'], pdf_content)
+    filestream = BytesIO(pdf_content)
     pdf = pymupdf.open(stream=filestream)
 
     records = db_get_paper(paper_id)
@@ -220,8 +231,12 @@ def read_and_get_abstract(html_url):
     content = response.text
     soup = BeautifulSoup(content, 'html.parser')
     abstract_header = soup.find('h6', string="Abstract")
+    if abstract_header is None:
+        return ""
     abstract_content = abstract_header.find_next_sibling("p")
     abstract_div = soup.find('div', class_="ltx_abstract")
+    if abstract_div is None:
+        return ""
     abstract_text = abstract_div.get_text()[8:]
     return " ".join(soup.get_text().split()), abstract_text
 
@@ -241,8 +256,27 @@ def keywords(serialized_job):
     if paper:
         title = paper['title']
         abstract = paper['abstract']
-        if title is None or abstract is None:
-            raise ValueError("Error getting keywords: no title or abstract")
+        if title is None:
+            raise ValueError("Error getting keywords: no title")
+        if abstract is None:
+            text, paper_abstract = read_and_get_abstract(html_url)
+            print(f"Abstract: {paper_abstract[:100]}")
+
+            records = db_get_paper(paper_id)
+            if not records:
+                raise ValueError("Error getting keywords: No paper with given id")
+            elif len(records) > 1:
+                print(f"{Colors.YELLOW}More than one paper found{Colors.WHITE}")
+
+            paper = records[0]
+            if paper:
+                with new_conn() as conn:
+                    conn.execute(f"""
+                        UPDATE papers
+                        SET abstract = '{paper_abstract}'
+                        WHERE external_id = '{paper_id}';
+                    """)
+                    conn.commit()
         text = title + abstract
         with new_conn() as conn:
             conn.execute(f"""
@@ -256,13 +290,16 @@ def keywords(serialized_job):
 
 
 if __name__ == "__main__":
+    drop = False
     try:
         test_tables()
     except Exception as e:
         print("Error testing tables:", e)
-    print(drop_table("papers"))
-    print(drop_table("vectors"))
-    print(drop_table("images"))
+    if drop:
+        print(drop_table("papers"))
+        print(drop_table("vectors"))
+        print(drop_table("images"))
+        test_tables()
     job = {
             "id": "arxiv.2511.11551",
             "pdf_url": "https://arxiv.org/pdf/2511.11551",

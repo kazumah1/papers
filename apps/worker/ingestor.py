@@ -4,7 +4,7 @@ import hashlib
 import feedparser
 from bs4 import BeautifulSoup
 from PyPDF2 import PdfReader
-from infra.postgres import _postgres_db
+from infra.postgres import _postgres_db, new_conn
 from infra.gcs import upload_paper
 from utils.utils import Colors
 import psycopg
@@ -12,7 +12,6 @@ import io
 import json
 
 URL : str = "http://export.arxiv.org/api/query?"
-CONN = _postgres_db()
 
 def _get_url(entry):
     '''returns the url of a specific entry'''
@@ -48,17 +47,17 @@ def store(serialized_job):
     print(f"{Colors.GREEN}Successfully stored paper to GCS{Colors.WHITE}")
 
 def db_push(serialized_job):
-    global CONN
     job = json.loads(serialized_job)
 
-    CONN.execute(
-        f"""INSERT INTO Papers 
-            (external_id, source, title, authors, pdf_url, html_url, content_hash, published_at) 
-            VALUES 
-            (%(id)s, %(source)s, %(title)s, %(authors)s, %(pdf_url)s, %(html_url)s, %(content_hash)s, %(published_at)s)
-            ON CONFLICT (external_id) DO NOTHING;
-        """,
-        job
-    )
-    CONN.commit()
+    with new_conn() as conn:
+        conn.execute(
+            f"""INSERT INTO Papers 
+                (external_id, source, title, authors, pdf_url, html_url, content_hash, published_at) 
+                VALUES 
+                (%(id)s, %(source)s, %(title)s, %(authors)s, %(pdf_url)s, %(html_url)s, %(content_hash)s, %(published_at)s)
+                ON CONFLICT (external_id) DO NOTHING;
+            """,
+            job
+        )
+        conn.commit()
     print(f"{Colors.GREEN}Successfully stored initial DB entry{Colors.WHITE}")

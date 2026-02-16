@@ -8,7 +8,8 @@ import requests
 from PyPDF2 import PdfReader
 import io
 from rq import Queue, Worker
-from infra.postgres import _postgres_db, _vector_db, _images_db, new_conn
+from infra.postgres import _postgres_db, _vector_db, _images_db, new_conn, db_search_by_pdf_url
+from infra.redis import get_cached_pdf, cache_pdf
 from apps.worker.processor import *
 from utils.utils import Colors
 from pgvector.psycopg import register_vector
@@ -72,11 +73,15 @@ class JobManager:
         for storing the raw pdf of the paper to GCS
         '''
         # ingest doc to object storage
-        pdf_url = job["pdf_url"]
-        response = requests.get(pdf_url)
+        pdf_content = get_cached_pdf(job['external_id'])
+        if pdf_content is None:
+            pdf_url = job["pdf_url"]
+            response = requests.get(pdf_url)
+            pdf_content = response.content
+            cache_pdf(job['external_id'], pdf_content)
         filename = job["content_hash"] + ".pdf"
 
-        upload_paper(filename, response.content)
+        upload_paper(filename, pdf_content)
 
         print(f"{Colors.GREEN}Successfully stored paper to GCS{Colors.WHITE}")
 
@@ -118,8 +123,13 @@ class JobManager:
         # self.worker = Worker([self.ingest_q, self.process_q], connection=self.redis)
 
     def hash_file(self, pdf_url):
-        response = requests.get(pdf_url)
-        mem_object = io.BytesIO(response.content)
+        pdf_content = get_cached_pdf(job['external_id'])
+        if pdf_content is None:
+            pdf_url = job["pdf_url"]
+            response = requests.get(pdf_url)
+            pdf_content = response.content
+            cache_pdf(job['external_id'], pdf_content)
+        mem_object = io.BytesIO(pdf_content)
         file = PdfReader(mem_object)
         h = hashlib.sha256()
         for page in file.pages:
@@ -144,11 +154,11 @@ class JobManager:
             "tags",
             "job_type"
             }
-        for key in job.keys():
-            if key not in required_fields:
-                raise ValueError("missing or incorrect key: ", key)
+        for field in required_fields:
+            if field not in job.keys():
+                raise ValueError("missing or incorrect field: ", field)
         serialized_job = json.dumps(job)
-        res = r.xadd("job_queue", {"job" : serialized_job}, maxlen=120, approximate=False)
+        res = r.xadd("job_queue", {"job" : serialized_job}, maxlen=5000, approximate=False)
         # if job['job_type'] in {'store', 'db_push'}:
         #     self.ingest_q.enqueue(self.JOBS[job['job_type']], serialized_job)
         # else:
@@ -167,6 +177,12 @@ class JobManager:
             - keywords: use tsvector to extract keywords from paper for later search and tagging (processor)
         '''
         pdf_url = self.arxiv.get_pdf_url(entry)
+        if pdf_url is None:
+            pdf_url = ""
+        else:
+            records = db_search_by_pdf_url(pdf_url)
+            if records:
+                return
         content_hash = self.hash_file(pdf_url)
         job_id = "arxiv." + entry['id'][21:]
         authors = self.arxiv.get_authors(entry)
@@ -211,28 +227,31 @@ class JobManager:
             try:
                 jobs = self.redis.xread(streams={"job_queue":0}, count=6, block=300)
                 if jobs and jobs[0] and jobs[0][1]:
-                    job = jobs[0][1][0]
-                    job_id, serialized_job = job[0], job[1].get(b'job', None)
-                    serialized_job = serialized_job.decode("utf-8")
-                    unserialized_job = json.loads(serialized_job)
-                    job_func = self.JOBS[unserialized_job['job_type']]
-                    print(f"{Colors.BLUE}Job: {unserialized_job['job_type']}{Colors.WHITE}")
-                    print(job[1])
-                    try:
-                        job_func(serialized_job)
-                    except Exception as e:
-                        print(f"{Colors.RED}{unserialized_job['job_type']} failed with exception {e}{Colors.WHITE}")
-                        i = 1
-                        success = False
-                        while i <= retries and success == False:
-                            print(f"Retrying, attempt {i} / {retries}:")
-                            try:
-                                job_func(serialized_job)
-                                success = True
-                            except Exception as e:
-                                print(f"{Colors.RED}attempt failed{Colors.WHITE}")
-                            i += 1
-                    self.redis.xdel("job_queue", job_id)
+                    j = 0
+                    while j < 6:
+                        job = jobs[0][1][j]
+                        job_id, serialized_job = job[0], job[1].get(b'job', None)
+                        serialized_job = serialized_job.decode("utf-8")
+                        unserialized_job = json.loads(serialized_job)
+                        job_func = self.JOBS[unserialized_job['job_type']]
+                        print(f"{Colors.BLUE}Job: {unserialized_job['job_type']}{Colors.WHITE}")
+                        print(job[1])
+                        try:
+                            job_func(serialized_job)
+                        except Exception as e:
+                            print(f"{Colors.RED}{unserialized_job['job_type']} failed with exception {e}{Colors.WHITE}")
+                            i = 1
+                            success = False
+                            while i <= retries and success == False:
+                                print(f"Retrying, attempt {i} / {retries}:")
+                                try:
+                                    job_func(serialized_job)
+                                    success = True
+                                except Exception as e:
+                                    print(f"{Colors.RED}attempt failed{Colors.WHITE}")
+                                i += 1
+                        self.redis.xdel("job_queue", job_id)
+                        j += 1
             except (KeyboardInterrupt, SystemExit):
                 self.jobs_info()
                 raise
